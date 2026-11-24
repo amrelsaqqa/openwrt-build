@@ -1,3 +1,4 @@
+
 name: Build OpenWrt image from exact commit
 
 on:
@@ -18,21 +19,34 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      # --------------------------------------------------
+      # 1. Checkout the exact requested OpenWrt commit
+      # --------------------------------------------------
       - name: Validate commit and clone exact OpenWrt source
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+
           SHA="${{ inputs.openwrt_commit }}"
+
           if [[ ! "$SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "openwrt_commit must be a full 40-character SHA" >&2
+            echo "ERROR: openwrt_commit must be a full 40-character SHA" >&2
             exit 1
           fi
+
           git clone https://github.com/openwrt/openwrt.git openwrt
           git -C openwrt fetch --no-tags origin "$SHA"
           git -C openwrt checkout --detach FETCH_HEAD
+
           ACTUAL="$(git -C openwrt rev-parse HEAD)"
-          test "${ACTUAL,,}" = "${SHA,,}"
+
+          if [[ "${ACTUAL,,}" != "${SHA,,}" ]]; then
+            echo "ERROR: Checked-out commit does not match requested commit" >&2
+            exit 1
+          fi
+
           echo "OPENWRT_COMMIT=$ACTUAL" >> "$GITHUB_ENV"
+
           {
             echo "## Source revision"
             echo ""
@@ -41,108 +55,255 @@ jobs:
             git -C openwrt show -s --format='%ci%n%s' HEAD
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # --------------------------------------------------
+      # 2. Install build dependencies
+      # --------------------------------------------------
       - name: Install build dependencies
         run: |
           sudo apt-get update
+
           sudo apt-get install -y \
             build-essential clang flex bison g++ gawk gcc-multilib \
             g++-multilib gettext git libncurses-dev libssl-dev \
             python3-distutils rsync unzip zlib1g-dev file wget \
             libelf-dev ecj fastjar java-propose-classpath \
-            python3 python3-setuptools qemu-utils
+            python3 python3-setuptools qemu-utils ccache
 
+      # --------------------------------------------------
+      # 3. Cache downloaded OpenWrt source archives
+      # --------------------------------------------------
+      - name: Cache OpenWrt downloads
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: ${{ runner.os }}-openwrt-dl-ramips-mt7621-v1
+
+      # --------------------------------------------------
+      # 4. Update and install feeds
+      # --------------------------------------------------
       - name: Update and install package feeds
         working-directory: openwrt
         run: |
+          set -euo pipefail
+
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Configure ramips/mt7621 initramfs image
+      # --------------------------------------------------
+      # 5. Configure ASUS RT-AX54
+      # --------------------------------------------------
+      - name: Configure ASUS RT-AX54 images
         working-directory: openwrt
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+
           cat > .config <<'EOF'
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
           CONFIG_TARGET_ramips=y
           CONFIG_TARGET_ramips_mt7621=y
           CONFIG_TARGET_ramips_mt7621_DEVICE_asus_rt-ax54=y
           CONFIG_TARGET_ROOTFS_INITRAMFS=y
           CONFIG_TARGET_ROOTFS_SQUASHFS=y
           EOF
+
           make defconfig
-          grep -E '^(CONFIG_TARGET_ramips=y|CONFIG_TARGET_ramips_mt7621=y|CONFIG_TARGET_ramips_mt7621_DEVICE_asus_rt-ax54=y|CONFIG_TARGET_ROOTFS_INITRAMFS=y)' .config
+
+          echo "Checking final build configuration..."
+
+          required_config=(
+            "CONFIG_DEVEL=y"
+            "CONFIG_CCACHE=y"
+            "CONFIG_TARGET_ramips=y"
+            "CONFIG_TARGET_ramips_mt7621=y"
+            "CONFIG_TARGET_ramips_mt7621_DEVICE_asus_rt-ax54=y"
+            "CONFIG_TARGET_ROOTFS_INITRAMFS=y"
+            "CONFIG_TARGET_ROOTFS_SQUASHFS=y"
+          )
+
+          for setting in "${required_config[@]}"; do
+            if ! grep -Fxq "$setting" .config; then
+              echo "ERROR: Required configuration is missing: $setting" >&2
+              exit 1
+            fi
+            echo "OK: $setting"
+          done
+
           {
             echo "## Build configuration"
             echo ""
             echo "- Target: \`ramips/mt7621\`"
-            echo "- Profile: \`asus_rt-ax54=\` (ASUS RT AX54)"
-            echo "- Image type: initramfs"
-            echo "- OpenWrt source commit: \`$OPENWRT_COMMIT\`"
+            echo "- Profile: \`asus_rt-ax54\`"
+            echo "- Root filesystem: SquashFS"
+            echo "- Initramfs: enabled"
+            echo "- Compiler cache: enabled"
+            echo "- OpenWrt commit: \`$OPENWRT_COMMIT\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # --------------------------------------------------
+      # 6. Cache compiler objects
+      # --------------------------------------------------
+      - name: Restore OpenWrt compiler cache
+        uses: actions/cache@v4
+        with:
+          path: openwrt/.ccache
+          key: ${{ runner.os }}-openwrt-ccache-ramips-mt7621-${{ inputs.openwrt_commit }}
+          restore-keys: |
+            ${{ runner.os }}-openwrt-ccache-ramips-mt7621-
+
+      - name: Configure compiler cache
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "CCACHE_DIR=$GITHUB_WORKSPACE/openwrt/.ccache" >> "$GITHUB_ENV"
+
+          mkdir -p "$GITHUB_WORKSPACE/openwrt/.ccache"
+
+          ccache -M 3G
+          ccache -z
+
+      # --------------------------------------------------
+      # 7. Download sources
+      # --------------------------------------------------
       - name: Download sources
         working-directory: openwrt
-        run: make download -j"$(nproc)"
+        run: |
+          set -euo pipefail
+          make download -j"$(nproc)"
 
-      - name: Build
+      # --------------------------------------------------
+      # 8. Build
+      # --------------------------------------------------
+      - name: Build OpenWrt
         working-directory: openwrt
-        run: make -j"$(nproc)" V=s
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" V=s
 
-      - name: Verify kernel version and collect build metadata
+      # --------------------------------------------------
+      # 9. Verify images and collect metadata
+      # --------------------------------------------------
+      - name: Verify images and collect build metadata
         working-directory: openwrt
         shell: bash
         run: |
-          set -euxo pipefail
-
-          echo "Kernel version declaration:"
-          grep -n '^LINUX_VERSION-6.6' include/kernel-6.6
-          grep -Eq '^LINUX_VERSION-6\.6[[:space:]]*=[[:space:]]*\.102$' include/kernel-6.6
-          echo "Verified: Linux 6.6.102"
+          set -euo pipefail
 
           IMAGE_DIR="bin/targets/ramips/mt7621"
+          OUTPUT_DIR="$GITHUB_WORKSPACE/artifacts"
 
-          echo "Available ASUS RT-AX54 images:"
+          echo "Checking kernel version declaration..."
+
+          grep -n '^LINUX_VERSION-6.6' include/kernel-6.6
+
+          if ! grep -Eq \
+            '^LINUX_VERSION-6\.6[[:space:]]*=[[:space:]]*\.102$' \
+            include/kernel-6.6; then
+            echo "ERROR: Expected Linux 6.6.102 was not found" >&2
+            exit 1
+          fi
+
+          echo "Verified Linux 6.6.102"
+
+          if [[ ! -d "$IMAGE_DIR" ]]; then
+            echo "ERROR: Image directory does not exist: $IMAGE_DIR" >&2
+            exit 1
+          fi
+
+          echo ""
+          echo "All generated ASUS RT-AX54 files:"
+
           find "$IMAGE_DIR" -maxdepth 1 -type f \
-            \( -name '*asus_rt-ax54*' -o -name '*initramfs*' \) -print
+            -name '*asus_rt-ax54*' \
+            -printf '%f (%s bytes)\n' | sort
 
           INITRAMFS="$(find "$IMAGE_DIR" -maxdepth 1 -type f \
-            -name '*asus_rt-ax54*initramfs*' -print -quit)"
+            -name '*asus_rt-ax54-initramfs-kernel.bin' -print -quit)"
 
           SYSUPGRADE="$(find "$IMAGE_DIR" -maxdepth 1 -type f \
-            -name '*asus_rt-ax54*sysupgrade*' -print -quit)"
+            -name '*asus_rt-ax54-squashfs-sysupgrade.bin' -print -quit)"
 
-          test -n "$INITRAMFS"
-          test -n "$SYSUPGRADE"
+          FACTORY="$(find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*asus_rt-ax54-squashfs-factory.bin' -print -quit)"
 
-          mkdir -p ../build-metadata
+          if [[ -z "$INITRAMFS" ]]; then
+            echo "ERROR: ASUS RT-AX54 initramfs image was not generated" >&2
+            exit 1
+          fi
 
-          cp "$IMAGE_DIR"/version.buildinfo ../build-metadata/ 2>/dev/null || true
-          cp "$IMAGE_DIR"/config.buildinfo ../build-metadata/ 2>/dev/null || true
-          cp "$IMAGE_DIR"/feeds.buildinfo ../build-metadata/ 2>/dev/null || true
+          if [[ -z "$SYSUPGRADE" ]]; then
+            echo "ERROR: ASUS RT-AX54 SquashFS sysupgrade image was not generated" >&2
+            exit 1
+          fi
 
-          git rev-parse HEAD > ../build-metadata/openwrt-commit.txt
+          mkdir -p "$OUTPUT_DIR/images" "$OUTPUT_DIR/metadata"
+
+          cp "$INITRAMFS" "$OUTPUT_DIR/images/"
+          cp "$SYSUPGRADE" "$OUTPUT_DIR/images/"
+
+          if [[ -n "$FACTORY" ]]; then
+            cp "$FACTORY" "$OUTPUT_DIR/images/"
+          fi
+
+          for file in version.buildinfo config.buildinfo feeds.buildinfo; do
+            if [[ -f "$IMAGE_DIR/$file" ]]; then
+              cp "$IMAGE_DIR/$file" "$OUTPUT_DIR/metadata/"
+            fi
+          done
+
+          git rev-parse HEAD \
+            > "$OUTPUT_DIR/metadata/openwrt-commit.txt"
 
           {
-            echo "## Generated images"
+            echo "Target: ramips/mt7621"
+            echo "Profile: asus_rt-ax54"
+            echo "Kernel: 6.6.102"
+            echo "Commit: $OPENWRT_COMMIT"
+          } > "$OUTPUT_DIR/metadata/build-info.txt"
+
+          (
+            cd "$OUTPUT_DIR/images"
+            sha256sum ./* > "$OUTPUT_DIR/metadata/image-sha256sums.txt"
+          )
+
+          echo ""
+          echo "Verified images:"
+          ls -lh "$OUTPUT_DIR/images"
+
+          {
+            echo "## Generated ASUS RT-AX54 images"
             echo ""
-            echo "- Initramfs: $(basename "$INITRAMFS")"
-            echo "- Sysupgrade: $(basename "$SYSUPGRADE")"
+            echo "| Image | Size |"
+            echo "|---|---:|"
+
+            for image in "$OUTPUT_DIR"/images/*; do
+              echo "| $(basename "$image") | $(du -h "$image" | cut -f1) |"
+            done
+
+            echo ""
+            echo "SHA-256 checksums are included in the artifact."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          sha256sum "$INITRAMFS" "$SYSUPGRADE" \
-            > ../build-metadata/image-sha256sums.txt
+      # --------------------------------------------------
+      # 10. Show compiler cache statistics
+      # --------------------------------------------------
+      - name: Show compiler cache statistics
+        if: always()
+        working-directory: openwrt
+        run: |
+          if [[ -d .ccache ]]; then
+            ccache -s || true
+          fi
 
-            
-      - name: Upload initramfs, sysupgrade and build metadata
+      # --------------------------------------------------
+      # 11. Upload firmware and metadata
+      # --------------------------------------------------
+      - name: Upload ASUS RT-AX54 images and metadata
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-ramips-mt7621-${{ inputs.openwrt_commit }}
-          path: |
-            openwrt/bin/targets/ramips/mt7621/*initramfs*
-            openwrt/bin/targets/ramips/mt7621/*sysupgrade*
-            openwrt/bin/targets/ramips/mt7621/version.buildinfo
-            openwrt/bin/targets/ramips/mt7621/config.buildinfo
-            openwrt/bin/targets/ramips/mt7621/feeds.buildinfo
-            build-metadata/
+          name: openwrt-rt-ax54-${{ inputs.openwrt_commit }}
+          path: artifacts/
           if-no-files-found: error
           retention-days: 30
