@@ -93,27 +93,53 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           echo "Kernel version declaration:"
           grep -n '^LINUX_VERSION-6.6' include/kernel-6.6
           grep -Eq '^LINUX_VERSION-6\.6[[:space:]]*=[[:space:]]*\.102$' include/kernel-6.6
-          echo "Verified: this source commit selects Linux 6.6.102."
-          echo "Built initramfs images:"
-          find bin/targets/ramips/mt7621 -maxdepth 1 -type f -name '*initramfs*' -print
-          test -n "$(find bin/targets/ramips/mt7621 -maxdepth 1 -type f -name '*initramfs*' -print -quit)"
-          mkdir -p ../build-metadata
-          cp bin/targets/ramips/mt7621/version.buildinfo ../build-metadata/ 2>/dev/null || true
-          cp bin/targets/ramips/mt7621/config.buildinfo ../build-metadata/ 2>/dev/null || true
-          cp bin/targets/ramips/mt7621/feeds.buildinfo ../build-metadata/ 2>/dev/null || true
-          git rev-parse HEAD > ../build-metadata/openwrt-commit.txt
-          git status --short > ../build-metadata/source-working-tree-status.txt
-          find bin/targets/ramips/mt7621 -maxdepth 1 -type f -name '*initramfs*' -exec sha256sum {} \; > ../build-metadata/initramfs-sha256sums.txt
+          echo "Verified: Linux 6.6.102"
 
-      - name: Upload initramfs image and build metadata
+          IMAGE_DIR="bin/targets/ramips/mt7621"
+
+          echo "Available ASUS RT-AX54 images:"
+          find "$IMAGE_DIR" -maxdepth 1 -type f \
+            \( -name '*asus_rt-ax54*' -o -name '*initramfs*' \) -print
+
+          INITRAMFS="$(find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*asus_rt-ax54*initramfs*' -print -quit)"
+
+          SYSUPGRADE="$(find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*asus_rt-ax54*sysupgrade*' -print -quit)"
+
+          test -n "$INITRAMFS"
+          test -n "$SYSUPGRADE"
+
+          mkdir -p ../build-metadata
+
+          cp "$IMAGE_DIR"/version.buildinfo ../build-metadata/ 2>/dev/null || true
+          cp "$IMAGE_DIR"/config.buildinfo ../build-metadata/ 2>/dev/null || true
+          cp "$IMAGE_DIR"/feeds.buildinfo ../build-metadata/ 2>/dev/null || true
+
+          git rev-parse HEAD > ../build-metadata/openwrt-commit.txt
+
+          {
+            echo "## Generated images"
+            echo ""
+            echo "- Initramfs: $(basename "$INITRAMFS")"
+            echo "- Sysupgrade: $(basename "$SYSUPGRADE")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          sha256sum "$INITRAMFS" "$SYSUPGRADE" \
+            > ../build-metadata/image-sha256sums.txt
+
+            
+      - name: Upload initramfs, sysupgrade and build metadata
         uses: actions/upload-artifact@v4
         with:
           name: openwrt-ramips-mt7621-${{ inputs.openwrt_commit }}
           path: |
             openwrt/bin/targets/ramips/mt7621/*initramfs*
+            openwrt/bin/targets/ramips/mt7621/*sysupgrade*
             openwrt/bin/targets/ramips/mt7621/version.buildinfo
             openwrt/bin/targets/ramips/mt7621/config.buildinfo
             openwrt/bin/targets/ramips/mt7621/feeds.buildinfo
